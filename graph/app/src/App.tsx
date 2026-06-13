@@ -1,28 +1,23 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Toaster, toast } from 'sonner'
-
-const CONTRACT = '0x853Df1088469bFf13e4dFbdb3637Ef40Dfd6DC09'
+import { read, write, CONTRACT } from './genlayer'
 
 type Intent = {
   id: number
+  key: string
   label: string
   statement: string
+  status: string
   confidence: number
   drift: number
+  evaluations: number
+  reasoning: string
   // canvas position in percent
   x: number
   y: number
   links: number[]
 }
-
-const SEED: Intent[] = [
-  { id: 1, label: 'Treasury safety', statement: 'The protocol treasury should never hold more than 40% in a single volatile asset.', confidence: 88, drift: 12, x: 26, y: 30, links: [2, 3] },
-  { id: 2, label: 'Fee fairness', statement: 'Transaction fees must scale sub-linearly with position size to protect small users.', confidence: 71, drift: 34, x: 58, y: 22, links: [1, 4] },
-  { id: 3, label: 'Validator honesty', statement: 'Validators that equivocate forfeit their entire stake, no grace period.', confidence: 94, drift: 6, x: 22, y: 64, links: [1, 5] },
-  { id: 4, label: 'Open liquidity', statement: 'Any vault should be permissionlessly composable without a whitelist.', confidence: 63, drift: 41, x: 72, y: 55, links: [2, 5] },
-  { id: 5, label: 'Slow governance', statement: 'Parameter changes require a 7-day timelock and two independent quorums.', confidence: 79, drift: 23, x: 48, y: 78, links: [3, 4] },
-]
 
 function confColor(c: number) {
   if (c >= 85) return '#22d3ee'
@@ -30,12 +25,49 @@ function confColor(c: number) {
   return '#ec4899'
 }
 
+// Normalise a 0-1 or 0-100 value into a 0-100 integer.
+function pct(v: any) {
+  let n = Number(v ?? 0)
+  if (!Number.isFinite(n)) n = 0
+  if (n > 0 && n <= 1) n *= 100
+  return Math.round(n)
+}
+
+function deriveLabel(statement: string, status: string) {
+  const w = (statement || '').trim().split(/\s+/).slice(0, 3).join(' ')
+  return w || status || 'intent'
+}
+
+function intentFrom(i: number, total: number, raw: any): Intent {
+  const statement = String(raw?.statement ?? '')
+  const angle = (2 * Math.PI * i) / Math.max(total, 1)
+  const radius = total <= 1 ? 0 : 28
+  return {
+    id: i,
+    key: String(i),
+    label: deriveLabel(statement, String(raw?.status ?? '')),
+    statement,
+    status: String(raw?.status ?? 'active'),
+    confidence: pct(raw?.confidence),
+    drift: pct(raw?.drift_score),
+    evaluations: Number(raw?.evaluations ?? 0),
+    reasoning: String(raw?.last_reasoning ?? ''),
+    x: 50 + radius * Math.cos(angle),
+    y: 50 + radius * Math.sin(angle),
+    links: i > 0 ? [i - 1] : [],
+  }
+}
+
 function App() {
-  const [intents, setIntents] = useState<Intent[]>(SEED)
+  const [intents, setIntents] = useState<Intent[]>([])
   const [activeId, setActiveId] = useState<number | null>(null)
   const [composing, setComposing] = useState(false)
-  const [draft, setDraft] = useState('')
-  const [label, setLabel] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [posting, setPosting] = useState(false)
+  const [reevaluatingId, setReevaluatingId] = useState<number | null>(null)
+  const [statement, setStatement] = useState('')
+  const [contextUrl, setContextUrl] = useState('')
+  const [parties, setParties] = useState('')
 
   const active = intents.find((i) => i.id === activeId) ?? null
 
@@ -43,49 +75,89 @@ function App() {
   const edges: { a: Intent; b: Intent }[] = []
   intents.forEach((i) =>
     i.links.forEach((lid) => {
-      if (i.id < lid) {
-        const other = intents.find((n) => n.id === lid)
-        if (other) edges.push({ a: i, b: other })
-      }
+      const other = intents.find((n) => n.id === lid)
+      if (other && i.id > lid) edges.push({ a: i, b: other })
     }),
   )
 
-  function reevaluate(id: number) {
-    toast('🜂 Re-evaluating intent against latest on-chain state…')
-    setTimeout(() => {
-      setIntents((list) =>
-        list.map((i) => {
-          if (i.id !== id) return i
-          const confidence = Math.max(35, Math.min(99, i.confidence + Math.floor(Math.random() * 30 - 15)))
-          const drift = Math.max(2, Math.min(80, 100 - confidence + Math.floor(Math.random() * 16 - 8)))
-          return { ...i, confidence, drift }
-        }),
-      )
-      toast.success('Intent re-evaluated — confidence and drift updated.')
-    }, 1800)
+  async function loadIntents() {
+    setLoading(true)
+    try {
+      const stats = (await read('stats')) as any
+      const total = Number(stats?.total_intents ?? 0)
+      const loaded: Intent[] = []
+      for (let i = 0; i < total; i++) {
+        try {
+          const raw = (await read('get_intent', [String(i)])) as any
+          if (raw) loaded.push(intentFrom(i, total, raw))
+        } catch {
+          // skip
+        }
+      }
+      setIntents(loaded)
+    } catch (e: any) {
+      toast.error(`Failed to load intents: ${e?.message ?? e}`)
+    } finally {
+      setLoading(false)
+    }
   }
 
-  function postIntent() {
-    if (!draft.trim() || !label.trim()) {
-      toast.error('Give the intent a label and a statement.')
+  useEffect(() => {
+    loadIntents()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  async function reevaluate(id: number) {
+    const node = intents.find((i) => i.id === id)
+    if (!node) return
+    setReevaluatingId(id)
+    const tid = toast.loading('🜂 Re-evaluating intent against latest on-chain state… (30–60s)')
+    try {
+      await write('reevaluate', [node.key])
+      const raw = (await read('get_intent', [node.key])) as any
+      setIntents((list) =>
+        list.map((i) =>
+          i.id === id
+            ? {
+                ...i,
+                confidence: pct(raw?.confidence),
+                drift: pct(raw?.drift_score),
+                status: String(raw?.status ?? i.status),
+                evaluations: Number(raw?.evaluations ?? i.evaluations),
+                reasoning: String(raw?.last_reasoning ?? i.reasoning),
+              }
+            : i,
+        ),
+      )
+      toast.success('Intent re-evaluated — confidence and drift updated.', { id: tid })
+    } catch (e: any) {
+      toast.error(`Re-evaluation failed: ${e?.message ?? e}`, { id: tid })
+    } finally {
+      setReevaluatingId(null)
+    }
+  }
+
+  async function postIntent() {
+    if (!statement.trim()) {
+      toast.error('State the intent in full.')
       return
     }
-    const id = Date.now()
-    const newNode: Intent = {
-      id,
-      label: label.trim(),
-      statement: draft.trim(),
-      confidence: 50 + Math.floor(Math.random() * 20),
-      drift: 30 + Math.floor(Math.random() * 30),
-      x: 30 + Math.random() * 40,
-      y: 30 + Math.random() * 40,
-      links: intents.length ? [intents[Math.floor(Math.random() * intents.length)].id] : [],
+    setPosting(true)
+    const tid = toast.loading('Posting intent on-chain… (30–60s)')
+    try {
+      await write('post_intent', [statement.trim(), contextUrl.trim(), parties.trim()])
+      const stats = (await read('stats')) as any
+      toast.success(`Intent posted — ${Number(stats?.total_intents ?? 0)} in the graph.`, { id: tid })
+      setStatement('')
+      setContextUrl('')
+      setParties('')
+      setComposing(false)
+      await loadIntents()
+    } catch (e: any) {
+      toast.error(`Post failed: ${e?.message ?? e}`, { id: tid })
+    } finally {
+      setPosting(false)
     }
-    setIntents((l) => [...l, newNode])
-    setDraft('')
-    setLabel('')
-    setComposing(false)
-    toast.success('Intent posted to the graph.')
   }
 
   return (
@@ -105,7 +177,7 @@ function App() {
       </div>
       <div className="pointer-events-none absolute right-6 top-6 z-20 text-right">
         <p className="font-mono text-[10px] text-white/25">{CONTRACT.slice(0, 12)}…{CONTRACT.slice(-6)}</p>
-        <p className="text-[10px] text-white/30">{intents.length} active intents</p>
+        <p className="text-[10px] text-white/30">{loading ? 'loading…' : `${intents.length} active intents`}</p>
       </div>
 
       {/* CANVAS */}
@@ -171,6 +243,17 @@ function App() {
             </motion.button>
           )
         })}
+
+        {!loading && intents.length === 0 && (
+          <p className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-sm text-white/30">
+            No intents yet — post the first one with +
+          </p>
+        )}
+        {loading && (
+          <p className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-sm text-white/30">
+            Loading intent graph from chain…
+          </p>
+        )}
       </div>
 
       {/* FLOATING + BUTTON */}
@@ -183,7 +266,7 @@ function App() {
       </button>
 
       {/* hint */}
-      {!active && (
+      {!active && !loading && intents.length > 0 && (
         <p className="pointer-events-none absolute bottom-10 left-1/2 z-10 -translate-x-1/2 text-xs text-white/30">
           click a glowing node to inspect its intent
         </p>
@@ -206,7 +289,7 @@ function App() {
                   className="text-[10px] uppercase tracking-[0.3em]"
                   style={{ color: confColor(active.confidence) }}
                 >
-                  intent · {active.label}
+                  intent · {active.status}
                 </span>
                 <h2 className="mt-2 text-xl font-bold leading-snug text-white">{active.statement}</h2>
               </div>
@@ -255,20 +338,21 @@ function App() {
             </div>
 
             <div className="mt-6 rounded-xl border border-white/10 bg-white/[0.03] p-4 text-xs text-white/50">
-              Linked to{' '}
-              <span className="text-cyan-300">
-                {active.links
-                  .map((l) => intents.find((n) => n.id === l)?.label)
-                  .filter(Boolean)
-                  .join(', ') || 'no other intents'}
-              </span>
+              <div className="mb-2 flex justify-between">
+                <span>evaluations</span>
+                <span className="text-cyan-300">{active.evaluations}</span>
+              </div>
+              <p className="leading-relaxed">
+                {active.reasoning || 'No reasoning recorded yet — re-evaluate to query the validators.'}
+              </p>
             </div>
 
             <button
               onClick={() => reevaluate(active.id)}
-              className="mt-auto w-full rounded-xl bg-gradient-to-r from-cyan-400 to-fuchsia-500 py-3 font-bold text-[#060608] transition hover:opacity-90"
+              disabled={reevaluatingId === active.id}
+              className="mt-auto w-full rounded-xl bg-gradient-to-r from-cyan-400 to-fuchsia-500 py-3 font-bold text-[#060608] transition hover:opacity-90 disabled:opacity-50"
             >
-              ⟳ Re-evaluate intent
+              {reevaluatingId === active.id ? '⟳ Re-evaluating…' : '⟳ Re-evaluate intent'}
             </button>
             <p className="mt-3 break-all font-mono text-[10px] text-white/20">{CONTRACT}</p>
           </motion.aside>
@@ -282,7 +366,7 @@ function App() {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            onClick={() => setComposing(false)}
+            onClick={() => !posting && setComposing(false)}
             className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm"
           >
             <motion.div
@@ -296,33 +380,41 @@ function App() {
                 Post a new intent
               </h3>
               <p className="mt-1 text-sm text-white/45">
-                It joins the graph as a glowing node, linked into the existing intent network.
+                It joins the graph as a glowing node, evaluated by the validator network.
               </p>
-              <input
-                value={label}
-                onChange={(e) => setLabel(e.target.value)}
-                placeholder="Short label (e.g. Fee fairness)"
-                className="mt-4 w-full rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2.5 text-sm text-white placeholder-white/25 outline-none focus:border-cyan-400/50"
-              />
               <textarea
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
+                value={statement}
+                onChange={(e) => setStatement(e.target.value)}
                 placeholder="State the intent in full…"
                 rows={3}
-                className="mt-3 w-full resize-none rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2.5 text-sm text-white placeholder-white/25 outline-none focus:border-fuchsia-400/50"
+                className="mt-4 w-full resize-none rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2.5 text-sm text-white placeholder-white/25 outline-none focus:border-cyan-400/50"
+              />
+              <input
+                value={contextUrl}
+                onChange={(e) => setContextUrl(e.target.value)}
+                placeholder="Context URL (evidence / source)"
+                className="mt-3 w-full rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2.5 text-sm text-white placeholder-white/25 outline-none focus:border-fuchsia-400/50"
+              />
+              <input
+                value={parties}
+                onChange={(e) => setParties(e.target.value)}
+                placeholder="Parties (e.g. DAO, counterparty)"
+                className="mt-3 w-full rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2.5 text-sm text-white placeholder-white/25 outline-none focus:border-fuchsia-400/50"
               />
               <div className="mt-5 flex gap-3">
                 <button
                   onClick={() => setComposing(false)}
-                  className="flex-1 rounded-lg border border-white/15 py-2.5 text-sm text-white/60 transition hover:bg-white/5"
+                  disabled={posting}
+                  className="flex-1 rounded-lg border border-white/15 py-2.5 text-sm text-white/60 transition hover:bg-white/5 disabled:opacity-50"
                 >
                   Cancel
                 </button>
                 <button
                   onClick={postIntent}
-                  className="flex-1 rounded-lg bg-gradient-to-r from-cyan-400 to-fuchsia-500 py-2.5 text-sm font-bold text-[#060608] transition hover:opacity-90"
+                  disabled={posting}
+                  className="flex-1 rounded-lg bg-gradient-to-r from-cyan-400 to-fuchsia-500 py-2.5 text-sm font-bold text-[#060608] transition hover:opacity-90 disabled:opacity-50"
                 >
-                  Add to graph
+                  {posting ? 'Posting…' : 'Add to graph'}
                 </button>
               </div>
             </motion.div>
