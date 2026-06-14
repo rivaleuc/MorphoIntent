@@ -16,15 +16,6 @@ Intents are alive. Their meaning shifts as the world changes:
 
 **GenLayer (Bradbury):** `0x853Df1088469bFf13e4dFbdb3637Ef40Dfd6DC09`
 
-## Test result
-
-Intent: "OpenAI will stay a capped-profit company through 2025"
-After one re-evaluation:
-- Status: **invalidated**
-- Confidence: **0%**
-- Drift score: **100**
-- Reasoning: "timeframe 'through 2025' has passed... must be considered invalidated by the passage of time"
-
 ## Structure
 
 ```
