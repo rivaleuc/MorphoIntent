@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Toaster, toast } from 'sonner'
-import { read, write, CONTRACT } from './genlayer'
+import { read, write, CONTRACT, connectWallet, isWalletConnected } from './genlayer'
 
 type Intent = {
   id: number
@@ -68,6 +68,19 @@ function App() {
   const [statement, setStatement] = useState('')
   const [contextUrl, setContextUrl] = useState('')
   const [parties, setParties] = useState('')
+  const [wallet, setWallet] = useState<string | null>(null)
+
+  const shortAddr = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`
+
+  async function handleConnect() {
+    try {
+      const addr = await connectWallet()
+      setWallet(addr)
+      toast.success(`Wallet connected · ${shortAddr(addr)}`)
+    } catch (e: any) {
+      toast.error(e?.message ?? 'Failed to connect wallet')
+    }
+  }
 
   const active = intents.find((i) => i.id === activeId) ?? null
 
@@ -175,7 +188,13 @@ function App() {
         </h1>
         <p className="text-[10px] uppercase tracking-[0.3em] text-white/30">intent graph · live</p>
       </div>
-      <div className="pointer-events-none absolute right-6 top-6 z-20 text-right">
+      <div className="pointer-events-none absolute right-6 top-6 z-20 flex flex-col items-end gap-2 text-right">
+        <button
+          onClick={handleConnect}
+          className="pointer-events-auto rounded-full bg-gradient-to-r from-cyan-400 to-fuchsia-500 px-4 py-1.5 text-sm font-bold text-[#060608] shadow-lg shadow-fuchsia-500/30 transition hover:opacity-90"
+        >
+          {wallet ? shortAddr(wallet) : isWalletConnected() ? 'Connected' : 'Connect Wallet'}
+        </button>
         <p className="font-mono text-[10px] text-white/25">{CONTRACT.slice(0, 12)}…{CONTRACT.slice(-6)}</p>
         <p className="text-[10px] text-white/30">{loading ? 'loading…' : `${intents.length} active intents`}</p>
       </div>
