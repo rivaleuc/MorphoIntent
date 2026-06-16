@@ -186,7 +186,7 @@ function App() {
         <h1 className="bg-gradient-to-r from-cyan-300 to-fuchsia-400 bg-clip-text text-lg font-black tracking-tight text-transparent">
           MorphoIntent
         </h1>
-        <p className="text-[10px] uppercase tracking-[0.3em] text-white/30">intent graph · live</p>
+        <p className="text-[10px] uppercase tracking-[0.3em] text-white/30">living intent graph · drift-tracked</p>
       </div>
       <div className="pointer-events-none absolute right-6 top-6 z-20 flex flex-col items-end gap-2 text-right">
         <button
@@ -399,7 +399,9 @@ function App() {
                 Post a new intent
               </h3>
               <p className="mt-1 text-sm text-white/45">
-                It joins the graph as a glowing node, evaluated by the validator network.
+                Any plain-language commitment becomes a public node in the graph — scored 0–100,
+                re-evaluated on a cadence, and tracked through the active → weakened → invalidated lifecycle
+                with a cumulative semantic-drift score.
               </p>
               <textarea
                 value={statement}

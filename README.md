@@ -1,21 +1,29 @@
 # MorphoIntent
 
-**A living intent graph — plain-language commitments that validators re-evaluate against the real world over time, tracking confidence and semantic drift.**
+**A public, multi-party Living Intent Graph — any plain-language commitment is posted as a node, re-evaluated on a cadence, and tracked with a numeric 0–100 confidence, a cumulative semantic-drift score, and an explicit status lifecycle (active → weakened → invalidated).**
 
-MorphoIntent stores commitments written in natural language ("we will keep the bridge fee under 0.1%", "this DAO funds open-source until 2026") and keeps asking, on demand, *does this still hold today?* Each re-evaluation fetches live context, an LLM judges current validity, and the contract tracks how far the intent's confidence has drifted from where it started. An intent isn't a static record — it morphs, weakens, drifts, or expires as the world changes.
+MorphoIntent is not an escrow, a covenant, or a single locked agreement. It is an **open graph of many intents** posted by many parties. Anyone writes a commitment in natural language ("we will keep the bridge fee under 0.1%", "this DAO funds open-source until 2026"), it becomes a glowing node in a shared graph, and anyone can ask — on demand — *does this still hold today?* Each re-evaluation fetches live context, validators judge current validity and emit a numeric confidence, the contract **derives the status band deterministically from that confidence**, and it accumulates how far the intent has drifted from where it started. An intent isn't a static record — it morphs, weakens, and is invalidated as the world changes.
 
-- **Contract (Bradbury, chain 4221):** `0x853Df1088469bFf13e4dFbdb3637Ef40Dfd6DC09`
-- **Explorer:** https://explorer-bradbury.genlayer.com/contract/0x853Df1088469bFf13e4dFbdb3637Ef40Dfd6DC09
+What makes it distinct:
+
+- **A graph, not a single agreement.** Many independent intents from many authors coexist as nodes; the value is the public, queryable web of living commitments.
+- **Numeric confidence drives everything.** Validators return an integer `0–100`; the status band is a pure function of that number (`>=67` active, `34–66` weakened, `<34` invalidated) — no free-form text decides state.
+- **Cumulative semantic-drift score.** Every re-evaluation adds `abs(Δconfidence)` to a running drift total, surfacing how far interpretation has wandered from the original statement over its whole history.
+- **Explicit lifecycle.** `active → weakened → invalidated`, with `expired` reserved for an author's explicit end-of-life flag.
+
+- **Contract (Bradbury, chain 4221):** `0x8E6F45f0C5268be86A95cd01821080636D794d33`
+- **Explorer:** https://explorer-bradbury.genlayer.com/contract/0x8E6F45f0C5268be86A95cd01821080636D794d33
 - **Live app:** https://morphointent.pages.dev
 
 ## What it does
 
-1. **`post_intent(statement, context_url, parties)`** — a `@gl.public.write` method. Stores a JSON record (author, statement, context URL, parties, `status="active"`, `confidence=100`, `drift_score=0`, `evaluations=0`, `history=[]`) in the `intents` `TreeMap[str, str]` keyed by `intent_count`. Rejects empty or >2000-char statements.
-2. **`reevaluate(intent_key)`** — a `@gl.public.write` method anyone can trigger. It runs a fresh evaluation, computes `drift_delta = abs(new_confidence - prev_confidence)`, accumulates `drift_score` (capped at 100), updates `status`/`confidence`/`last_reasoning`, appends to a rolling 5-entry `history`, and flips status to `"drifted"` once `drift_score >= DRIFT_THRESHOLD` (30). Bumps the global `total_evaluations`.
-3. The private `_evaluate(intent)` builds the non-deterministic block:
+1. **`post_intent(statement, context_url, parties)`** — a `@gl.public.write` method. Stores a JSON record (author, statement, context URL, parties, `status="active"`, `confidence=100`, `drift_score=0`, `evaluations=0`, `expired=false`, `history=[]`) in the `intents` `TreeMap[str, str]` keyed by `intent_count`. Rejects empty or >2000-char statements.
+2. **`expire_intent(intent_key)`** — a `@gl.public.write` method; only the author can set the explicit expiry flag, moving the intent to `status="expired"` and stopping further re-evaluation.
+3. **`reevaluate(intent_key)`** — a `@gl.public.write` method anyone can trigger. It runs a fresh evaluation, computes `drift_delta = abs(new_confidence - prev_confidence)`, accumulates `drift_score` (capped at 100), and updates `status`/`confidence`/`last_reasoning` from the new verdict, appending to a rolling 5-entry `history`. Bumps the global `total_evaluations`. The **status is never taken from free-form LLM text** — it is the deterministic band of the numeric confidence.
+4. The private `_evaluate(intent)` builds the non-deterministic block:
    - **Validators crawl live context.** `leader_fn` tries `gl.nondet.web.get(context_url)` (decoding 4000 bytes) and falls back to `gl.nondet.web.render(context_url, mode="text")` — so judgment is grounded in the world *as it is now*.
-   - **An LLM acts as evaluator.** `gl.nondet.exec_prompt(prompt, response_format="json")` gets the statement, the previous confidence, and the live context, and must reply `{"status": "active"/"weakened"/"invalidated"/"expired", "confidence": <0-100>, "reasoning": "..."}`.
-   - **Consensus via `gl.vm.run_nondet_unsafe(leader_fn, validator_fn)`.** `validator_fn` requires a `gl.vm.Return`, `status` in the allowed set, an `int` `confidence` in `[0, 100]`, and a string `reasoning` — validators agree the verdict is well-formed, not byte-identical.
+   - **An LLM acts as evaluator.** `gl.nondet.exec_prompt(prompt, response_format="json")` gets the statement, the previous confidence, and the live context, and must reply `{"confidence": <int 0-100>, "reasoning": "..."}`. The **leader derives the status band** from that confidence (`derive_status`), so honest leaders always satisfy the invariant.
+   - **Consensus via `gl.vm.run_nondet_unsafe(leader_fn, validator_fn)`.** `validator_fn` enforces a deterministic cross-field invariant: `confidence` is an `int` in `[0,100]` (a `bool` is rejected via `isinstance(x, bool)`), `status` is in the enum, **`status` matches the confidence band** (`expired` accepted only when `confidence < 34`), and `reasoning` is a non-empty string. Validators agree the verdict is internally consistent — never byte-identical text.
 4. **Reads** are free `@gl.public.view` calls: `get_intent(key)` (full record + history), `read_status(key)` → `{valid, status, confidence, drift_score}` so external contracts can act on intent validity (`valid` is true while status is `active` or `weakened`), and `stats()` → `{total_intents, total_evaluations}`.
 
 State lives in the `intents` `TreeMap`; `intent_count` and `total_evaluations` are `u256`; the module constant `DRIFT_THRESHOLD = 30`.
@@ -32,7 +40,9 @@ Use MorphoIntent when a commitment's meaning must be continuously re-checked aga
 
 | GenLayer contract | Frontend dir | EVM / off-chain |
 | --- | --- | --- |
-| `graph/morpho_intent.py` | `graph/app/` (React + Vite) | `graph/IntentBond.sol` (bond that settles on intent status) |
+| `graph/morpho_intent.py` | `graph/app/` (React + Vite) | `graph/IntentBond.sol` (optional example consumer that reads `read_status` for one node) |
+
+The graph is the product; `IntentBond.sol` is just one possible external consumer that reads a single node's status. The contract itself holds an open, multi-author set of intents and is not tied to any one bond or escrow.
 
 ## Tech
 
@@ -83,8 +93,9 @@ Cloudflare Pages:
 
 Real gotchas learned building this:
 
-- **Integers, not floats.** `confidence`, `drift_score`, and `DRIFT_THRESHOLD` are all integers in `[0, 100]`, and `validator_fn` rejects a non-int confidence. Drift math (`abs`, `min(100, …)`) stays in integer space so validators agree exactly.
-- **Validate structure, not exact LLM output.** `validator_fn` checks `status` is in the allowed set and `confidence` is an int in range; it never compares the `reasoning` text. The drift signal comes from how the *numeric* confidence moves, not from string diffs.
+- **Integers, not floats.** `confidence` and `drift_score` are integers in `[0, 100]`, and `validator_fn` rejects a non-int (or `bool`) confidence. Drift math (`abs`, `min(100, …)`) stays in integer space so validators agree exactly.
+- **Status is derived, never parsed from prose.** The leader computes the status band from the numeric confidence (`derive_status`) and `validator_fn` re-checks that `status` matches the band. The `reasoning` text is never compared — comparing free-form LLM text across validators would hang consensus.
+- **Drift is a separate signal from status.** The cumulative `drift_score` records how much interpretation has moved over the intent's life; it is surfaced to consumers but does not itself flip the lifecycle state — the confidence band does.
 - **ACCEPTED ≠ executed.** Consensus means validators accepted the evaluation, not that any bond settled. `IntentBond.sol` must read `read_status` and act as a separate step.
 - **Optimistic finality has an appeal window.** Each re-evaluation is provisional until the appeal window elapses; the frontend waits for `FINALIZED` before treating a new status as authoritative.
 - **Evidence is untrusted (greybox).** Live context comes from a user-supplied URL with a `get`→`render` fallback; the prompt treats fetched context as adversarial input, and fetch failures degrade to `(context fetch failed)` rather than crashing the re-evaluation.
