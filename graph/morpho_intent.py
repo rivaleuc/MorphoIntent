@@ -7,6 +7,41 @@ STATUS_ENUM = ("active", "weakened", "invalidated", "expired")
 
 
 # ----------------------------------------------------------------------
+# EVM bridge: the GenLayer contract is the *resolver* of an IntentBond
+# vault (graph/IntentBond.sol). When an intent is settled, this contract
+# reads its own on-chain verdict and emits the matching settlement call
+# to the EVM vault — so the bond outcome is enforced by the GenLayer
+# judgment, not by a trusted off-chain script. This uses the supported
+# gl.evm.contract_interface primitive (same family as emit_transfer).
+# ----------------------------------------------------------------------
+@gl.evm.contract_interface
+class IIntentBond:
+    class View:
+        pass
+
+    class Write:
+        def returnBond(self, id: u256, /) -> None: ...
+        def claimBond(self, id: u256, /) -> None: ...
+        def splitBond(self, id: u256, depositorBps: u256, /) -> None: ...
+
+
+def derive_settlement(status: str, confidence: int) -> dict:
+    """Pure mapping from an intent verdict to a vault action.
+
+    active            -> returnBond  (intent holds: funds back to depositor)
+    invalidated/expired -> claimBond (intent broken: funds to beneficiary)
+    weakened          -> splitBond   (partial: depositor keeps confidence%)
+    """
+    if status == "active":
+        return {"action": "returnBond", "depositor_bps": 10000}
+    if status in ("invalidated", "expired"):
+        return {"action": "claimBond", "depositor_bps": 0}
+    # weakened: split proportionally to confidence (0-100 -> 0-10000 bps)
+    bps = max(0, min(10000, int(confidence) * 100))
+    return {"action": "splitBond", "depositor_bps": bps}
+
+
+# ----------------------------------------------------------------------
 # Deterministic verdict logic (module-level, unit-testable, shared by
 # leader_fn and validator_fn). The status is a pure function of the
 # numeric confidence band — no free-form LLM text comparison.
@@ -81,10 +116,14 @@ class MorphoIntent(gl.Contract):
     intents: TreeMap[str, str]
     intent_count: u256
     total_evaluations: u256
+    owner: str
+    vault: str
 
     def __init__(self):
         self.intent_count = u256(0)
         self.total_evaluations = u256(0)
+        self.owner = str(gl.message.sender_address)
+        self.vault = ""
 
     @gl.public.write
     def post_intent(self, statement: str, context_url: str, parties: str) -> str:
@@ -245,6 +284,72 @@ Reply ONLY valid JSON:
             "status": i["status"],
             "confidence": i["confidence"],
             "drift_score": i["drift_score"],
+        }
+
+    # ------------------------------------------------------------------
+    # Vault settlement bridge (GenLayer verdict -> EVM IntentBond)
+    # ------------------------------------------------------------------
+    @gl.public.write
+    def set_vault(self, vault_address: str) -> None:
+        """Owner wires the IntentBond vault this contract resolves for."""
+        if str(gl.message.sender_address) != self.owner:
+            raise Exception("only owner")
+        self.vault = str(vault_address).strip()
+
+    @gl.public.view
+    def get_vault(self) -> dict:
+        return {"vault": self.vault, "owner": self.owner}
+
+    @gl.public.view
+    def preview_settlement(self, key: str) -> dict:
+        """What settlement the current verdict maps to (no state change)."""
+        key = str(key)
+        if key not in self.intents:
+            return {"exists": False}
+        i = json.loads(self.intents[key])
+        s = derive_settlement(i["status"], int(i["confidence"]))
+        return {
+            "exists": True,
+            "status": i["status"],
+            "confidence": int(i["confidence"]),
+            "action": s["action"],
+            "depositor_bps": s["depositor_bps"],
+        }
+
+    @gl.public.write
+    def settle_bond(self, intent_key: str, bond_id: int) -> dict:
+        """Map the GenLayer settlement of an intent into the IntentBond vault.
+
+        This contract is the vault's resolver, so the emitted EVM call is
+        authorised by the on-chain judgment of the intent — not a trusted
+        off-chain actor.
+        """
+        if not self.vault:
+            raise Exception("vault not set")
+        intent_key = str(intent_key)
+        if intent_key not in self.intents:
+            raise Exception("unknown intent")
+        i = json.loads(self.intents[intent_key])
+        status = i["status"]
+        confidence = int(i["confidence"])
+        s = derive_settlement(status, confidence)
+
+        bond = IIntentBond(Address(self.vault))
+        bid = u256(int(bond_id))
+        if s["action"] == "returnBond":
+            bond.emit().returnBond(bid)
+        elif s["action"] == "claimBond":
+            bond.emit().claimBond(bid)
+        else:
+            bond.emit().splitBond(bid, u256(int(s["depositor_bps"])))
+
+        return {
+            "intent": intent_key,
+            "bond_id": int(bond_id),
+            "status": status,
+            "confidence": confidence,
+            "action": s["action"],
+            "depositor_bps": s["depositor_bps"],
         }
 
     @gl.public.view

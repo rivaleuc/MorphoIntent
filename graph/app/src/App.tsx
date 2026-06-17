@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Toaster, toast } from 'sonner'
 import { read, write, CONTRACT, connectWallet, isWalletConnected } from './genlayer'
+import { VAULT, createBond as vaultCreateBond, settle as vaultSettle, bondCount, readBond, type Bond } from './vault'
 
 type Intent = {
   id: number
@@ -69,6 +70,13 @@ function App() {
   const [contextUrl, setContextUrl] = useState('')
   const [parties, setParties] = useState('')
   const [wallet, setWallet] = useState<string | null>(null)
+
+  // ---- IntentBond escrow bridge (GenLayer verdict -> EVM vault) ----
+  const [bonds, setBonds] = useState<(Bond & { id: number })[]>([])
+  const [bondAmount, setBondAmount] = useState('0.01')
+  const [bondBeneficiary, setBondBeneficiary] = useState('')
+  const [bonding, setBonding] = useState(false)
+  const [settlingBond, setSettlingBond] = useState<number | null>(null)
 
   const shortAddr = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`
 
@@ -170,6 +178,80 @@ function App() {
       toast.error(`Post failed: ${e?.message ?? e}`, { id: tid })
     } finally {
       setPosting(false)
+    }
+  }
+
+  // Load every bond escrowed against the selected intent.
+  async function loadBonds(intentId: number) {
+    try {
+      const total = await bondCount()
+      const found: (Bond & { id: number })[] = []
+      for (let i = 0; i < total; i++) {
+        try {
+          const b = await readBond(i)
+          if (b.intentKey === intentId) found.push({ ...b, id: i })
+        } catch {
+          /* skip */
+        }
+      }
+      setBonds(found)
+    } catch {
+      setBonds([])
+    }
+  }
+
+  // Re-load bonds whenever the active intent changes.
+  useEffect(() => {
+    if (activeId !== null) loadBonds(activeId)
+    else setBonds([])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId])
+
+  async function lockBond() {
+    if (activeId === null) return
+    const amt = Number(bondAmount)
+    if (!Number.isFinite(amt) || amt <= 0) {
+      toast.error('Enter a bond amount in GEN.')
+      return
+    }
+    const bene = bondBeneficiary.trim() || '0x000000000000000000000000000000000000dEaD'
+    setBonding(true)
+    const tid = toast.loading('Locking bond on the IntentBond vault…')
+    try {
+      const wei = BigInt(Math.round(amt * 1e18))
+      await vaultCreateBond(bene, activeId, wei)
+      toast.success(`Bond locked — ${amt} GEN escrowed against this intent.`, { id: tid })
+      setBondBeneficiary('')
+      await loadBonds(activeId)
+    } catch (e: any) {
+      toast.error(`Bond failed: ${e?.shortMessage ?? e?.message ?? e}`, { id: tid })
+    } finally {
+      setBonding(false)
+    }
+  }
+
+  // Read the GenLayer verdict and map it into the matching vault settlement.
+  async function settleBond(bondId: number, intentId: number) {
+    setSettlingBond(bondId)
+    const tid = toast.loading('Reading GenLayer verdict and settling the bond…')
+    try {
+      const v = (await read('preview_settlement', [String(intentId)])) as any
+      const action = String(v?.action ?? '') as 'returnBond' | 'claimBond' | 'splitBond'
+      if (!action) throw new Error('no verdict for this intent')
+      const bps = Number(v?.depositor_bps ?? 0)
+      await vaultSettle(action, bondId, bps)
+      const label =
+        action === 'returnBond'
+          ? 'intent holds → bond returned to depositor'
+          : action === 'claimBond'
+            ? 'intent broken → bond paid to beneficiary'
+            : `intent weakened → split ${(bps / 100).toFixed(0)}% to depositor`
+      toast.success(`Settled: ${label}.`, { id: tid })
+      await loadBonds(intentId)
+    } catch (e: any) {
+      toast.error(`Settle failed: ${e?.shortMessage ?? e?.message ?? e}`, { id: tid })
+    } finally {
+      setSettlingBond(null)
     }
   }
 
@@ -300,7 +382,7 @@ function App() {
             animate={{ x: 0 }}
             exit={{ x: '100%' }}
             transition={{ type: 'spring', stiffness: 260, damping: 30 }}
-            className="absolute right-0 top-0 z-40 flex h-full w-full max-w-sm flex-col border-l border-white/10 bg-[#0a0a0f]/95 p-7 backdrop-blur-xl"
+            className="absolute right-0 top-0 z-40 flex h-full w-full max-w-sm flex-col overflow-y-auto border-l border-white/10 bg-[#0a0a0f]/95 p-7 backdrop-blur-xl"
           >
             <div className="flex items-start justify-between">
               <div>
@@ -366,10 +448,78 @@ function App() {
               </p>
             </div>
 
+            {/* INTENT BOND — escrow whose release follows the GenLayer verdict */}
+            <div className="mt-6 rounded-xl border border-cyan-400/20 bg-cyan-400/[0.04] p-4">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] uppercase tracking-[0.25em] text-cyan-300/80">intent bond · escrow</span>
+                <a
+                  href={`https://explorer-bradbury.genlayer.com/address/${VAULT}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="font-mono text-[9px] text-white/25 hover:text-cyan-300"
+                >
+                  {VAULT.slice(0, 8)}…{VAULT.slice(-4)}
+                </a>
+              </div>
+              <p className="mt-1 text-[11px] leading-relaxed text-white/35">
+                Lock GEN behind this intent. Settlement reads the on-chain verdict and routes funds:
+                <span className="text-cyan-300"> active → return</span>,
+                <span className="text-rose-300"> invalidated → claim</span>,
+                <span className="text-fuchsia-300"> weakened → split by confidence</span>.
+              </p>
+
+              {bonds.length > 0 && (
+                <div className="mt-3 space-y-2">
+                  {bonds.map((b) => (
+                    <div
+                      key={b.id}
+                      className="flex items-center justify-between rounded-lg border border-white/10 bg-black/30 px-3 py-2"
+                    >
+                      <div className="text-[11px] text-white/60">
+                        <span className="text-white/80">#{b.id}</span> · {(Number(b.amount) / 1e18).toFixed(4)} GEN
+                        {b.settled && <span className="ml-2 text-emerald-400">settled ✓</span>}
+                      </div>
+                      {!b.settled && (
+                        <button
+                          onClick={() => settleBond(b.id, active.id)}
+                          disabled={settlingBond === b.id}
+                          className="rounded-md bg-cyan-400/90 px-2.5 py-1 text-[11px] font-bold text-[#060608] transition hover:bg-cyan-300 disabled:opacity-50"
+                        >
+                          {settlingBond === b.id ? 'settling…' : 'settle by verdict'}
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="mt-3 flex gap-2">
+                <input
+                  value={bondAmount}
+                  onChange={(e) => setBondAmount(e.target.value)}
+                  placeholder="GEN"
+                  className="w-16 rounded-md border border-white/10 bg-white/[0.03] px-2 py-1.5 text-[11px] text-white outline-none focus:border-cyan-400/50"
+                />
+                <input
+                  value={bondBeneficiary}
+                  onChange={(e) => setBondBeneficiary(e.target.value)}
+                  placeholder="beneficiary 0x… (counterparty)"
+                  className="flex-1 rounded-md border border-white/10 bg-white/[0.03] px-2 py-1.5 text-[11px] text-white placeholder-white/25 outline-none focus:border-cyan-400/50"
+                />
+                <button
+                  onClick={lockBond}
+                  disabled={bonding}
+                  className="rounded-md border border-cyan-400/40 px-2.5 py-1.5 text-[11px] font-bold text-cyan-300 transition hover:bg-cyan-400/10 disabled:opacity-50"
+                >
+                  {bonding ? '…' : 'lock'}
+                </button>
+              </div>
+            </div>
+
             <button
               onClick={() => reevaluate(active.id)}
               disabled={reevaluatingId === active.id}
-              className="mt-auto w-full rounded-xl bg-gradient-to-r from-cyan-400 to-fuchsia-500 py-3 font-bold text-[#060608] transition hover:opacity-90 disabled:opacity-50"
+              className="mt-4 w-full rounded-xl bg-gradient-to-r from-cyan-400 to-fuchsia-500 py-3 font-bold text-[#060608] transition hover:opacity-90 disabled:opacity-50"
             >
               {reevaluatingId === active.id ? '⟳ Re-evaluating…' : '⟳ Re-evaluate intent'}
             </button>

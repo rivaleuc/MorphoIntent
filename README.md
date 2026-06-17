@@ -11,8 +11,9 @@ What makes it distinct:
 - **Cumulative semantic-drift score.** Every re-evaluation adds `abs(Δconfidence)` to a running drift total, surfacing how far interpretation has wandered from the original statement over its whole history.
 - **Explicit lifecycle.** `active → weakened → invalidated`, with `expired` reserved for an author's explicit end-of-life flag.
 
-- **Contract (Bradbury, chain 4221):** `0x8E6F45f0C5268be86A95cd01821080636D794d33`
-- **Explorer:** https://explorer-bradbury.genlayer.com/contract/0x8E6F45f0C5268be86A95cd01821080636D794d33
+- **Contract (Bradbury, chain 4221):** `0x4b169ac90366325d4134621C7E239FbB8C8E18F0`
+- **Explorer:** https://explorer-bradbury.genlayer.com/contract/0x4b169ac90366325d4134621C7E239FbB8C8E18F0
+- **IntentBond vault (EVM, chain 4221):** `0x6d314Ca81BadB98be04c482b939e691534834aE5`
 - **Live app:** https://morphointent.pages.dev
 
 ## What it does
@@ -24,7 +25,8 @@ What makes it distinct:
    - **Validators crawl live context.** `leader_fn` tries `gl.nondet.web.get(context_url)` (decoding 4000 bytes) and falls back to `gl.nondet.web.render(context_url, mode="text")` — so judgment is grounded in the world *as it is now*.
    - **An LLM acts as evaluator.** `gl.nondet.exec_prompt(prompt, response_format="json")` gets the statement, the previous confidence, and the live context, and must reply `{"confidence": <int 0-100>, "reasoning": "..."}`. The **leader derives the status band** from that confidence (`derive_status`), so honest leaders always satisfy the invariant.
    - **Consensus via `gl.vm.run_nondet_unsafe(leader_fn, validator_fn)`.** `validator_fn` enforces a deterministic cross-field invariant: `confidence` is an `int` in `[0,100]` (a `bool` is rejected via `isinstance(x, bool)`), `status` is in the enum, **`status` matches the confidence band** (`expired` accepted only when `confidence < 34`), and `reasoning` is a non-empty string. Validators agree the verdict is internally consistent — never byte-identical text.
-4. **Reads** are free `@gl.public.view` calls: `get_intent(key)` (full record + history), `read_status(key)` → `{valid, status, confidence, drift_score}` so external contracts can act on intent validity (`valid` is true while status is `active` or `weakened`), and `stats()` → `{total_intents, total_evaluations}`.
+4. **Reads** are free `@gl.public.view` calls: `get_intent(key)` (full record + history), `read_status(key)` → `{valid, status, confidence, drift_score}` so external contracts can act on intent validity (`valid` is true while status is `active` or `weakened`), `preview_settlement(key)` → `{status, confidence, action, depositor_bps}` (the vault action the current verdict maps to), and `stats()` → `{total_intents, total_evaluations}`.
+5. **Settlement bridge.** `set_vault(addr)` (owner) wires an `IntentBond` escrow; `settle_bond(intent_key, bond_id)` reads the intent's verdict and emits the matching EVM call through `gl.evm.contract_interface` (the supported primitive — same family as `emit_transfer`). The mapping is a pure, unit-tested function `derive_settlement(status, confidence)`: **active → `returnBond`** (funds back to depositor), **invalidated/expired → `claimBond`** (funds to beneficiary), **weakened → `splitBond`** by confidence (`depositor_bps = confidence × 100`). The live frontend exercises the same mapping directly: it locks a bond (`createBond`, payable), reads `preview_settlement`, and calls the matching vault function — so the bond outcome is driven by the GenLayer judgment, end to end.
 
 State lives in the `intents` `TreeMap`; `intent_count` and `total_evaluations` are `u256`; the module constant `DRIFT_THRESHOLD = 30`.
 
@@ -38,11 +40,11 @@ Use MorphoIntent when a commitment's meaning must be continuously re-checked aga
 
 ## Architecture
 
-| GenLayer contract | Frontend dir | EVM / off-chain |
+| GenLayer contract | Frontend dir | EVM / settlement |
 | --- | --- | --- |
-| `graph/morpho_intent.py` | `graph/app/` (React + Vite) | `graph/IntentBond.sol` (optional example consumer that reads `read_status` for one node) |
+| `graph/morpho_intent.py` | `graph/app/` (React + Vite, `src/vault.ts` bridge) | `graph/IntentBond.sol` — escrow whose release follows the intent verdict |
 
-The graph is the product; `IntentBond.sol` is just one possible external consumer that reads a single node's status. The contract itself holds an open, multi-author set of intents and is not tied to any one bond or escrow.
+The graph is the product; `IntentBond.sol` is the escrow consumer the frontend wires to. The flow is: lock a bond against an intent → the GenLayer verdict (`preview_settlement` / `read_status`) decides the direction → the matching settlement call releases funds (`returnBond` / `claimBond` / `splitBond`). The contract holds an open, multi-author set of intents; any number of bonds can reference the same intent without the contract being coupled to one escrow.
 
 ## Tech
 
@@ -96,7 +98,7 @@ Real gotchas learned building this:
 - **Integers, not floats.** `confidence` and `drift_score` are integers in `[0, 100]`, and `validator_fn` rejects a non-int (or `bool`) confidence. Drift math (`abs`, `min(100, …)`) stays in integer space so validators agree exactly.
 - **Status is derived, never parsed from prose.** The leader computes the status band from the numeric confidence (`derive_status`) and `validator_fn` re-checks that `status` matches the band. The `reasoning` text is never compared — comparing free-form LLM text across validators would hang consensus.
 - **Drift is a separate signal from status.** The cumulative `drift_score` records how much interpretation has moved over the intent's life; it is surfaced to consumers but does not itself flip the lifecycle state — the confidence band does.
-- **ACCEPTED ≠ executed.** Consensus means validators accepted the evaluation, not that any bond settled. `IntentBond.sol` must read `read_status` and act as a separate step.
+- **ACCEPTED → settlement is wired.** Consensus means validators accepted the evaluation. The verdict then drives the escrow: `settle_bond` emits the matching `IntentBond` call on-chain, and the frontend exposes the same mapping via `preview_settlement` + a direct vault call. Settlement is restricted to the bond's depositor or the registered resolver — never anonymous.
 - **Optimistic finality has an appeal window.** Each re-evaluation is provisional until the appeal window elapses; the frontend waits for `FINALIZED` before treating a new status as authoritative.
 - **Evidence is untrusted (greybox).** Live context comes from a user-supplied URL with a `get`→`render` fallback; the prompt treats fetched context as adversarial input, and fetch failures degrade to `(context fetch failed)` rather than crashing the re-evaluation.
 

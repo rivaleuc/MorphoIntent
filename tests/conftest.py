@@ -43,6 +43,31 @@ def _install_fake_genlayer():
     class _message:
         sender_address = "0x0000000000000000000000000000000000000000"
 
+    class Address(str):
+        pass
+
+    class _evm:
+        @staticmethod
+        def contract_interface(cls):
+            # Return a factory that yields a proxy with .emit()/.view() no-ops.
+            class _Proxy:
+                def __init__(self, addr):
+                    self.addr = addr
+
+                def emit(self, *a, **k):
+                    class _W:
+                        def __getattr__(self, name):
+                            return lambda *a, **k: None
+                    return _W()
+
+                def view(self, *a, **k):
+                    class _V:
+                        def __getattr__(self, name):
+                            return lambda *a, **k: 0
+                    return _V()
+
+            return _Proxy
+
     class _web:
         @staticmethod
         def get(*a, **k):
@@ -72,10 +97,12 @@ def _install_fake_genlayer():
         public = _public
         message = _message
         nondet = _nondet
+        evm = _evm
 
     m.gl = _gl
     m.u256 = u256
     m.TreeMap = TreeMap
+    m.Address = Address
     sys.modules["genlayer"] = m
     return m
 

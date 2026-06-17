@@ -69,3 +69,23 @@ def test_bad_status_rejected(contract):
 
 def test_empty_reasoning_rejected(contract):
     assert not contract.validate_verdict({"status": "active", "confidence": 80, "reasoning": "  "})
+
+
+def test_settlement_mapping(contract):
+    # active -> full return to depositor
+    s = contract.derive_settlement("active", 90)
+    assert s["action"] == "returnBond" and s["depositor_bps"] == 10000
+    # invalidated/expired -> claim to beneficiary
+    assert contract.derive_settlement("invalidated", 10)["action"] == "claimBond"
+    assert contract.derive_settlement("expired", 0)["action"] == "claimBond"
+    assert contract.derive_settlement("invalidated", 10)["depositor_bps"] == 0
+    # weakened -> split by confidence
+    s = contract.derive_settlement("weakened", 50)
+    assert s["action"] == "splitBond" and s["depositor_bps"] == 5000
+    s = contract.derive_settlement("weakened", 34)
+    assert s["action"] == "splitBond" and s["depositor_bps"] == 3400
+
+
+def test_settlement_bps_clamped(contract):
+    assert contract.derive_settlement("weakened", 999)["depositor_bps"] == 10000
+    assert contract.derive_settlement("weakened", -5)["depositor_bps"] == 0
